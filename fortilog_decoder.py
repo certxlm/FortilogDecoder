@@ -30,6 +30,9 @@ import os
 import gzip
 import zstandard as zstd
 import struct
+import xmltodict
+import json
+import time
 
 debug = False
 gz_output_file = False #if the target file should be gz compressed
@@ -38,6 +41,10 @@ gz_output_file = False #if the target file should be gz compressed
 magic = b'\xEC\xCF'
 tlc_magic = b'\xAA\x01'
 tlc_fields = ["","devid","devname","vdom","devtype","logtype","tmzone","fazid","srcip","unused?","unused?","num-logs","unzip-len","incr-zip","unzip-len-p","prefix","zbuf","logs"]
+
+ems_magic = b'\xBB\x02'
+#...)<E
+event_magic = b'\x00\x00\xf0\x29\x3c\x45'
 
 DCTX = zstd.ZstdDecompressor(max_window_size=2**31)
 file_ptr_pos = 0
@@ -81,13 +88,33 @@ def process_file(sourcefile,outstream):
             s = gzip.open(sourcefile)
         elif sourcefile.endswith(".zst"):
             s = zstd.open(sourcefile,"rb",dctx=DCTX)
+        elif sourcefile.endswith(".log"):
+            s = open(sourcefile,"rb")
         else:
             raise Exception()
         decode_llogv5(s,sourcefile,outstream)
         s.close()
     except Exception as e:
-        output_info(f"Skipped {sourcefile} - failed to open file, not a gz/zst file?",outstream,False)
+        output_info(f"Skipped {sourcefile} - failed to open file, not a gz/zst file? ({e})",outstream,False)
 
+def parse_evtx(decompressed):
+  res = decompressed
+  try:
+    evtx = decompressed.decode()
+    evtx = evtx.replace("\r\n", " @@ ")
+    xml = xmltodict.parse(evtx)
+    datetime = xml["Event"]["System"]["TimeCreated"]["@SystemTime"]
+    description = xml["Event"]["System"]["Provider"]["@Name"]
+    eid = xml["Event"]["System"]["EventID"]
+    if isinstance(eid, dict):
+      eid = ":".join(eid.values())
+    todump = {"datetime":datetime,"description":description,"message":eid}
+    todump.update(xml)
+    jsonl = json.dumps(todump)
+    res = str.encode(jsonl)
+  except Exception as e:
+    print(f"unable to parse evtx: {e}\n{decompressed}", file=sys.stderr)
+  return res
 
 def decode_llogv5(instream,sourcefile,outstream):
     """
@@ -110,6 +137,7 @@ def decode_llogv5(instream,sourcefile,outstream):
             devname = body[ldevid:ldevid+ldevname].decode("utf-8") eg. fa123
             vdom = body[ldevid+ldevname:ldevid+ldevname+lvdom].decode("utf-8") eg. root
             '''            
+            continue
             output_info(f"Found lz4 entry at file offset {file_ptr_pos}",outstream,True)
             #1st variable part
             head = instream.read(16)
@@ -149,6 +177,47 @@ def decode_llogv5(instream,sourcefile,outstream):
             head2 = instream.read(2)
             body2 = int.from_bytes(head2,"little")
             instream.read(body2)
+
+        elif logtype == ems_magic:
+            output_info(f"Found ems entry at file offset {file_ptr_pos}",outstream,True)
+            lmagic = 2
+            # 17 seems to work, don't really care what's inside apart the size of the body
+            lheader = 17
+            header = instream.read(lheader)
+            lbody = int.from_bytes(header[4:6],"big") -lmagic -lheader
+            body = instream.read(lbody)
+            # which means we have to brute-force the body to find what we need
+            # in this case, we're looking for the start of <Event
+            lwhatever = 0
+            for i in range(0,len(body) - len(event_magic)):
+              found = body[i:i+len(event_magic)]
+              if found == event_magic:
+                lwhatever = i + 2
+            if lwhatever == 0:
+              print("unable to find start of event", file=sys.stderr)
+              continue
+            whatever = body[:lwhatever]
+            whatmatter = whatever[-17::]
+            # lhing and ldecompressed are not always in fixed positions
+            # fortunately.... we don't care, lcompressed is enough for us
+            #lhint = int.from_bytes(whatmatter[0:2], "big")
+            #ldecompressed =  int.from_bytes(whatmatter[5:7], "little")
+            lcompressed =  int.from_bytes(whatmatter[13:15], "little")
+            # LZ4 is fast and cheap. Therefore it's compressed ratio is not good
+            # since blocks are never really big, we can simply over allocate size for decompression
+            ldecompressed = lcompressed * 5
+            body = body[lwhatever:]
+            try:
+              compressed = body[:lcompressed]
+              decompressed = lz4.block.decompress(compressed,ldecompressed)
+              # we have a winevtx in xml, but multiline. Let's parse it and convert it to json now
+              jsonl = parse_evtx(decompressed)
+              entries = [jsonl]
+              output_logs(outstream,entries)
+            except Exception as e:
+              print(f"unable to decompress data: {lcompressed}:{ldecompressed}: {e}", file=sys.stderr)
+              continue
+
        
         elif logtype == tlc_magic:
             '''
